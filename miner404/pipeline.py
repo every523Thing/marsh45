@@ -40,8 +40,6 @@ from openai.types.responses.response_create_params import ResponseCreateParamsBa
 from witness_client import ExchangePending, RenderOptions, RenderRejected, RenderUnavailable, WitnessError
 
 from . import match, patch, prompts
-from .texfix import texfix
-from .powfix import fix_unary_pow
 from .budget import CALL_LIMIT, CREDIT_LIMIT, PRICING, SAFETY, Budget, worst_case
 from .fallback import fallback_module
 from .images import data_url, object_closeup, png_data_url, to_jpeg, view_sheet, zoomed_views
@@ -74,6 +72,19 @@ CRITIQUE_ID = 9400  # the critique of the drafts; + 10 the module merged from th
 CALL_RESERVE = 3  # calls the round planner leaves for one repair
 JUDGE_MAX_OUTPUT = 4096
 JUDGE_DRAW = 0.7  # the judge's own first-stage draw threshold, in mean penalty points
+_HALF_METAL = re.compile(r"metalness\s*[:=]\s*0?\.(2[5-9]\d*|[34]\d*)\b")
+JUDGE_VIEW_NAMES = ("slightly left of the front", "slightly right of the front", "the front, from slightly below", "the front, from slightly above")
+JUDGE_VIEWS_USER = ("You see two 3D models, each rendered from four cameras: " + "; ".join(f"view {i + 1} = {d}" for i, d in enumerate(JUDGE_VIEW_NAMES)) + ".\n"
+                    "The reference image shows the target object.\n\nFor EACH view separately, which model is a more faithful 3D reproduction of the reference?\n\n"
+                    "Before you score a view, check these three things in that view, in this order:\n"
+                    "1. Pose: does the object stand, lie or lean the way the reference shows it, or does it look tipped over, toppled or floating?\n"
+                    "2. Visible parts: are the surfaces and parts the reference shows (its top or front face, its base or legs, its markings and fine detail) "
+                    "visible and readable here, or hidden, squashed to a thin edge, or seen from an unnatural side?\n"
+                    "3. Shape and proportions as they appear from this camera.\n"
+                    "Score every view with the same care; the view from slightly below counts exactly as much as the others.\n\n"
+                    "Penalty 0-10:\n0 = Perfect match to reference\n3 = Minor issues (slight shape differences, missing small details)\n5 = Moderate issues (wrong style, significant details missing)\n"
+                    "7 = Major issues (wrong category but related, e.g. chair vs stool)\n10 = Completely wrong object\n\n"
+                    'Output: {"views": [{"view": 1, "penalty_1": <0-10>, "penalty_2": <0-10>}, {"view": 2, ...}, {"view": 3, ...}, {"view": 4, ...}], "issues": "<brief>"}')
 CHECK_SEVERITY = 5  # what the inspector must report before the finished module is rewritten
 POST_PICK_STEPS = 3  # rewrites of the final pick (steps 7-9: rewrite 700/800/900, selection 9070/9080/9090)
 POST_PICK_REWRITE = (SOL, "xhigh")  # the rewrite of the plan's last step
@@ -259,14 +270,16 @@ export default function generate(THREE) {
   return root;
 }
 """
+# A marker line just before the fit: the outline-fit step is inserted at it.
 _PRE_FIT = """  // uniform fit, centred
-"""  # a marker line: the outline step is placed before the fit here
+"""
 _FIT = "  const box = new THREE.Box3().setFromObject(root);\n"
 
 _EXPORT_LINE = "export default function generate(THREE) {\n"
 # The validator's box is not per-vertex: it wraps each part's own box after rotating it, so a rotated part inflates the box
-# and the fit then shrinks the whole object (an apple turned 40 degrees renders at half the area). Moving every transform
-# into the vertices makes that box snug, so the same model renders larger and still passes.
+# and the fit then shrinks the whole object (an apple whose module builds it rotated 40 degrees renders at half the
+# area). Moving each part's own transform into its vertices makes that box snug, so the same model renders larger and
+# still passes.
 _OUTLINE_FUNCTION = """
 function __bake404(THREE, root) {
   root.updateMatrixWorld(true);
@@ -341,8 +354,6 @@ def chain_wrapper(fill: float, outline_fit: bool = False) -> str:
 
 
 _EXPORT = re.compile(r"export\s+default\s+function\s*(?:[A-Za-z_$][\w$]*\s*)?\(")
-
-
 
 
 
@@ -447,7 +458,7 @@ class Candidate:
     raw: str = ""  # the model's own module, before wrapping
     views: list[bytes] = field(default_factory=list)  # close-ups of the four front views
     parent: Candidate | None = None
-    match: float = 0.0  # how closely the views match the photo, in measured plans
+    match: float = 0.0
     measurements: str = ""
     overlay: bytes = b""
     fixes: list[str] = field(default_factory=list)  # the selector's fixes from the last selection that scored it
@@ -545,8 +556,29 @@ def extract_source(text: str) -> str | None:
     return text if _EXPORT.search(text) else None
 
 
+
+_EXP_OPERAND = r"(?:\d+(?:\.\d+)?|[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[[^\[\]\n]*\])*(?:\([^()\n]*\))?|\([^()\n]*\))"
+_UNARY_POW = re.compile(r"-\s*(" + _EXP_OPERAND + r")\s*\*\*\s*(-?\s*" + _EXP_OPERAND + r")")
+_PREFIX_WORDS = ("return", "typeof", "case", "yield", "void", "in", "of", "else", "do")
+
+
+def exponent_safe(source: str) -> str:
+    """-x ** 2 is a syntax error in JavaScript (the models write it as in Python): wrap it as -(x ** 2). Only a minus that is unary
+    (after an operator, an opening bracket, a comma, a keyword or the line start) is touched, so valid code never changes."""
+    out, last = [], 0
+    for m in _UNARY_POW.finditer(source):
+        before = source[:m.start()].rstrip()
+        prev = before[-1:] if before else ""
+        word = re.search(r"[A-Za-z_$][\w$]*$", before)
+        if prev and (prev.isalnum() or prev in "_$)]}\"'`") and not (word and word.group(0) in _PREFIX_WORDS):
+            continue
+        out += [source[last:m.start()], f"-({m.group(1)} ** {m.group(2)})"]
+        last = m.end()
+    return "".join(out) + source[last:] if out else source
+
 def normalize(source: str, wrapper: str = WRAPPER) -> str:
     """Wrap the module so its asset is centered and scaled to fill the unit cube, whatever its scale."""
+    source = exponent_safe(source)
     match = _EXPORT.search(source)
     if match is None:
         return source
@@ -827,6 +859,13 @@ class Pipeline:
             extra += prompts.HISTORY_BLOCK.format(history="\n".join(lines))
         return extra
 
+    def fits_keeping(self, call: Call) -> bool:
+        """Whether the budget admits this rewrite and still its two gate calls."""
+        text_chars = len(call.instructions) + sum(len(c.get("text", "")) for c in call.content)
+        images = sum(1 for c in call.content if c["type"] == "input_image")
+        return self.budget.allows([worst_case(call.model, text_chars, images, call.max_output_tokens)], keep_calls=2,
+                                  keep_credits=2 * SELECT_CALL_CREDITS)
+
     def fits(self, call: Call) -> bool:
         """Whether the budget would admit this call now."""
         text_chars = len(call.instructions) + sum(len(c.get("text", "")) for c in call.content)
@@ -864,7 +903,9 @@ class Pipeline:
                 raise CallFailed(f"call {call.request_id}: reply without usage")
             # A failed or incomplete reply with usage is a saved response, so replay returns it too.
             return result if result.status == "completed" else None
-        except APIConnectionError:
+        except APIConnectionError as error:
+            if getattr(error.__cause__, "code", None) == "capture_failed":
+                return None  # a recorded failed capture fails the same way on every replay: the call is lost, the prompt goes on
             raise  # the witness reports delivery failures and timeouts this way; the runtime recovers the call
         except APIError as error:
             raise CallFailed(f"call {call.request_id}: {error}") from error
@@ -941,7 +982,6 @@ class Pipeline:
             source = extract_source(reply.output_text) if reply is not None else None
             if source is None:
                 continue
-            source = fix_unary_pow(source)
             outcome = self.render(name, normalize(source))
             if isinstance(outcome, Candidate):
                 candidates.append(outcome)
@@ -955,7 +995,6 @@ class Pipeline:
         for (name, _, _), reply in zip(rejected, self.run_stage(pool, repairs), strict=True):
             source = extract_source(reply.output_text) if reply is not None else None
             if source is not None:
-                source = fix_unary_pow(source)
                 outcome = self.render(name + "r", normalize(source))
                 if isinstance(outcome, Candidate):
                     candidates.append(outcome)
@@ -994,7 +1033,6 @@ class Pipeline:
                 raw = extract_source(reply.output_text) if reply is not None else None
             if raw is None:
                 continue
-            raw = fix_unary_pow(raw)  # `-x ** 2` is a JavaScript syntax error: written as `-(x ** 2)`, not sent to a repair
             outcome = self.render_module(names[index], normalize(raw, self.wrapper), raw)
             if isinstance(outcome, Candidate):
                 outcome.notes = reply.output_text.split("```")[0].strip()[:2000]
@@ -1007,10 +1045,11 @@ class Pipeline:
                 {"type": "input_text", "text": prompts.REPAIR.format(errors=errors, source=raw)}])
             for index, raw, errors in rejected
         ]
+        kept_repairs = [(item, call) for item, call in zip(rejected, repairs) if self.fits_keeping(call)]  # never eat the gate reserve
+        rejected, repairs = [item for item, _ in kept_repairs], [call for _, call in kept_repairs]
         for (index, _, _), reply in zip(rejected, self.run_stage(pool, repairs), strict=True):
             raw = extract_source(reply.output_text) if reply is not None else None
             if raw is not None:
-                raw = fix_unary_pow(raw)
                 outcome = self.render_module(names[index], normalize(raw, self.wrapper), raw)
                 if isinstance(outcome, Candidate):
                     results[index] = outcome
@@ -1111,13 +1150,14 @@ class Pipeline:
         """Score candidates twice in opposite orders on the front views and the grid; lower is better."""
         ordered = candidates.copy()
         random.Random(f"{self.seed}:{self.digest}:{request_id}").shuffle(ordered)
-        labels = {chr(65 + i): candidate for i, candidate in enumerate(ordered)}
+        # the mirrored call lists the candidates in reverse AND relabels them, so no candidate keeps its letter or its place
+        maps = [{chr(65 + i): candidate for i, candidate in enumerate(order)} for order in (ordered, ordered[::-1])]
         calls = []
-        for offset, order in enumerate((list(labels), list(reversed(labels)))):
+        for offset, labels in enumerate(maps):
             content: list[dict[str, Any]] = [{"type": "input_text", "text": "TARGET:"}, self.target, *self.closeup]
             if self.brief:
                 content.append({"type": "input_text", "text": self.brief})
-            for label in order:
+            for label in labels:
                 content += [
                     {"type": "input_text", "text": f"CANDIDATE {label} FRONT VIEWS:"},
                     {"type": "input_image", "image_url": data_url(labels[label].front), "detail": "high"},
@@ -1126,7 +1166,11 @@ class Pipeline:
                 ]
             calls.append(Call(request_id + offset, SOL, instructions, content, SELECT_EFFORT, SELECT_MAX_OUTPUT,
                               text=prompts.select_close_schema(list(labels))))
-        judgements = self.parse_judgement(labels, self.run_stage(pool, calls))
+        parts = [self.parse_judgement(labels, [reply]) for labels, reply in zip(maps, self.run_stage(pool, calls), strict=True)]
+        judgements = {}
+        for name in dict.fromkeys(name for part in parts for name in part):
+            got = [part[name] for part in parts if name in part]
+            judgements[name] = Judgement(sum(j.score for j in got) / len(got), list(dict.fromkeys(f for j in got for f in j.fixes))[:8])
         for candidate in candidates:
             if candidate.name in judgements:
                 candidate.fixes = judgements[candidate.name].fixes
@@ -1205,7 +1249,6 @@ class Pipeline:
     def run_stages(self, plan: StagePlan) -> str:
         self.wrapper = chain_wrapper(plan.fill, plan.outline_fit or plan.measured)
         self.keep_shots = any(step.judge_pick for step in plan.steps)
-        self.end_reserve = 0.0
         closeup = object_closeup(self.image)
         if closeup is not None:
             self.closeup = [{"type": "input_image", "image_url": data_url(closeup), "detail": "high"}]
@@ -1234,7 +1277,6 @@ class Pipeline:
                 if plan.merge_pick:
                     survivors = [self.merged_pick(pool, drafts, survivors[0]), *survivors[1:]]
                 self.best_so_far = survivors[0].source
-            searched = False
             steps = list(plan.steps)
             for index in range(len(steps)):
                 if plan.replan and index:
@@ -1258,21 +1300,7 @@ class Pipeline:
                 winner = self.checked(pool, winner)
                 self.best_so_far = winner.source
             source = self.fitted_last(winner, plan) if plan.outline_fit_last else winner.source
-            return self.texfixed(source)
-
-    def texfixed(self, source: str | None) -> str | None:
-        """The finished module with smooth sampling on unfiltered data textures (texfix.py); as it is when nothing changes
-        or the renderer refuses it (one render of the judge's front views, no model calls)."""
-        if not source:
             return source
-        candidate = texfix(source)
-        if candidate == source:
-            return source
-        try:
-            self.renderer.render(candidate, FRONT_JUDGE)
-        except RenderRejected:
-            return source
-        return candidate
 
 
     def fitted_last(self, winner: Candidate, plan: StagePlan) -> str:
@@ -1328,8 +1356,10 @@ class Pipeline:
                     parent.fixes = self.reviewed(pool, parent, REVIEW_ID + 10 * (index + 1) + position)
                 extra = self.feedback(step, parent) + step.nudge
                 call = self.rewrite_call(request_id, model, effort, parent, focus, extra, step.patch)
-                if step.fallback and not self.fits(call):
+                if step.fallback and not self.fits_keeping(call):
                     call = self.rewrite_call(request_id, *step.fallback, parent, focus, extra, step.patch)
+                if not self.fits_keeping(call):  # the gate's calls and credits are kept: a late step that would eat them is skipped
+                    continue
                 if step.patch:
                     bases[len(calls)] = parent.raw
                 calls.append(call)
@@ -1440,7 +1470,7 @@ def run(image: bytes, seed: int, calls: ModelCalls, renderer: Renderer, plan: Pl
 ROUND_COST = {("gpt-6-astra", "high"): (494, 10313), ("gpt-6.1-sol", "xhigh"): (10712, 9125), ("gpt-6.1-sol", "high"): (748, 9575)}
 SELECT_CALL_CREDITS = 15731
 MODULE_GROWTH = 1.15
-GUARD_HEADROOM = 300_000  # the guard reserves the worst case before each call, about 0.3M above a last round's expected cost  # modules grow over the rounds; this brings the forecast to the measured median
+GUARD_HEADROOM = 300_000
 
 
 def round_cost(rewrite: tuple[str, str], tokens: float) -> float:
@@ -1453,7 +1483,7 @@ def round_cost(rewrite: tuple[str, str], tokens: float) -> float:
             + 2 * SELECT_CALL_CREDITS)
 
 
-MODULE_CHARS_PER_TOKEN = 2.85  # module code, measured on rewrite replies
+MODULE_CHARS_PER_TOKEN = 2.85
 PATCH_FLOOR = 0.4  # the least a patch-edit reply is taken to cost, as a share of the whole module
 PATCH_PRIOR = 0.6  # that share before any patch-edit reply of this prompt has been seen
 MERGE_COST = (748, 11000)  # a round's merge call: reasoning tokens, and input tokens besides the two modules
