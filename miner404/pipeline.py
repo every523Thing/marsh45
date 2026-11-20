@@ -77,7 +77,6 @@ JUDGE_DRAW = 0.7  # the judge's own first-stage draw threshold, in mean penalty 
 CHECK_SEVERITY = 5  # what the inspector must report before the finished module is rewritten
 POST_PICK_STEPS = 3  # rewrites of the final pick (steps 7-9: rewrite 700/800/900, selection 9070/9080/9090)
 POST_PICK_REWRITE = (SOL, "xhigh")  # the rewrite of the plan's last step
-METAL_PASS = 'const __m404 = new Set(); root.traverse((o) => { const list = o.material ? (Array.isArray(o.material) ? o.material : [o.material]) : []; for (const m of list) { if (__m404.has(m)) continue; __m404.add(m); if (m.metalness !== undefined && m.metalness >= 0.25) { m.metalness = 1.0; m.roughness = Math.max(0.25, m.roughness === undefined ? 0.25 : m.roughness); } } });'  # shiny metal at 1.0 metalness; roughness at least 0.25, the model's own when higher
 BRIEF_ID = 9990
 TEXT_READ_ID = 9985  # the text read-out before the drafts
 BRIEF_MAX_OUTPUT = 4096
@@ -1258,7 +1257,7 @@ class Pipeline:
             if plan.check:
                 winner = self.checked(pool, winner)
                 self.best_so_far = winner.source
-            source = self.stronger_metal(self.fitted_last(winner, plan) if plan.outline_fit_last else winner.source)
+            source = self.fitted_last(winner, plan) if plan.outline_fit_last else winner.source
             return self.texfixed(source)
 
     def texfixed(self, source: str | None) -> str | None:
@@ -1275,21 +1274,6 @@ class Pipeline:
             return source
         return candidate
 
-    def stronger_metal(self, source: str) -> str:
-        """Metal the photo shows as shiny reads as plastic at the capped values. As it is when no part is metal or the renderer refuses."""
-        if not re.search(r"metalness\s*[:=]\s*(0?\.(2[5-9]|[3-9])|1)", source):
-            return source
-        at = source.rfind("const box = new THREE.Box3()")
-        at = at if at >= 0 else source.rfind("new THREE.Box3()")
-        if at < 0:
-            return source
-        line = source.rfind("\n", 0, at) + 1
-        turned = source[:line] + "  " + METAL_PASS + "\n" + source[line:]
-        try:
-            self.renderer.render(turned, FRONT_JUDGE)
-        except RenderRejected:
-            return source
-        return turned
 
     def fitted_last(self, winner: Candidate, plan: StagePlan) -> str:
         """The finished module with the outline fit, or as it is if the fit is rejected."""
